@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / URL-encoded files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Temporary & test outputs
+_tmp_test/
+*.tmp
+*.log
+_verify_*.png
+_test_*.png
+
+# OS metadata
+.DS_Store
+Thumbs.db
