@@ -275,7 +275,7 @@ class TestBatchReliability(unittest.TestCase):
         """Test 12: Context manager with exception cleans socket and does not re-send failed batch on exit."""
         mock_sock = MagicMock()
         with patch.object(figcraft_ui.socket, "socket", return_value=mock_sock):
-            client = FigCraftClient(host="127.0.0.1", port=7979, strict=True)
+            client = FigCraftClient(host="127.0.0.1", port=7979, auto_batch=True, strict=True)
 
             with patch.object(client, "execute", side_effect=TimeoutError("Timeout in flush")) as mock_exec:
                 with self.assertRaises(TimeoutError):
@@ -489,6 +489,32 @@ class TestBatchReliability(unittest.TestCase):
         self.assertEqual(client_cmd._resolved_refs, {})
         self.assertIn("expected command 'node.create', got 'node.delete'", client_cmd.last_error)
         self.assertIsNotNone(client_cmd.last_failed_batch)
+
+    def test_22_live_streaming_mode_executes_immediately_with_select_and_delay(self):
+        """Test 22 (v4.0): Default live streaming mode executes immediately with select=True and step_delay_ms sleep."""
+        mock_sock = MagicMock()
+        with patch.object(figcraft_ui.socket, "socket", return_value=mock_sock):
+            client = FigCraftClient(host="127.0.0.1", port=7979)
+
+        self.assertFalse(client.auto_batch)
+        self.assertTrue(client.live_select)
+        self.assertEqual(client.step_delay_ms, 50.0)
+        self.assertTrue(client.auto_launch)
+
+        with patch.object(client, "execute", return_value={"id": 901}) as mock_exec, \
+             patch.object(figcraft_ui.time, "sleep") as mock_sleep:
+            node_id = client.create_frame(name="LiveFrame", width=1440, height=900)
+
+        self.assertEqual(node_id, 901)
+        self.assertEqual(client._batch_queue, [])
+        mock_exec.assert_called_once()
+        sent_params = mock_exec.call_args[0][1]
+        self.assertTrue(sent_params["select"])
+        mock_sleep.assert_called_once_with(0.05)
+
+    def test_23_equalize_heights_alias_matches_equasize_heights(self):
+        """Test 23 (v4.0): equalize_heights is bound as an alias to equasize_heights."""
+        self.assertIs(FigCraftClient.equalize_heights, FigCraftClient.equasize_heights)
 
 
 if __name__ == "__main__":

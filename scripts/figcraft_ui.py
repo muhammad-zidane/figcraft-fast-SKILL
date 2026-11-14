@@ -1,5 +1,5 @@
 """
-figcraft_ui.py (v3.0) - Production Batch UI Automation Library for FigCraft.
+figcraft_ui.py (v4.0) - Live Streaming & Batch UI Automation Library for FigCraft.
 Communicates with FigCraft Engine over TCP JSON-RPC (engine.execute).
 """
 
@@ -10,9 +10,12 @@ import time
 import re
 import copy
 import math
+import subprocess
+import shutil
 from typing import Union, List, Dict, Optional, Any
 
 NodeRef = Union[int, str, Dict[str, str]]
+DEFAULT_FIGCRAFT_APP = r"C:\Program Files\FigCraft\figcraft.exe"
 
 
 class FigCraftError(RuntimeError):
@@ -25,13 +28,21 @@ class FigCraftClient:
         self,
         host: str = "127.0.0.1",
         port: int = 7979,
-        auto_batch: bool = True,
-        strict: bool = True
+        auto_batch: bool = False,
+        strict: bool = True,
+        live_select: bool = True,
+        step_delay_ms: float = 50.0,
+        auto_launch: bool = True,
+        app_path: Optional[str] = None
     ):
         self.host = host
         self.port = port
         self.auto_batch = auto_batch
         self.strict = strict
+        self.live_select = live_select
+        self.step_delay_ms = step_delay_ms
+        self.auto_launch = auto_launch
+        self.app_path = app_path
         self.sock: Optional[socket.socket] = None
         self._req_id = 0
         self._step_counter = 0
@@ -55,25 +66,72 @@ class FigCraftClient:
                 pass
             self.sock = None
 
-    def connect(self):
-        """Connects strictly to the configured host:port (no silent port switching)."""
-        self._close_socket()
+    def _find_figcraft_binary(self) -> Optional[str]:
+        """Finds the figcraft.exe executable on the host machine."""
+        if self.app_path and os.path.exists(self.app_path):
+            return self.app_path
+        candidates = [
+            DEFAULT_FIGCRAFT_APP,
+            r"C:\Program Files (x86)\FigCraft\figcraft.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\FigCraft\figcraft.exe"),
+        ]
+        for cand in candidates:
+            if cand and os.path.exists(cand):
+                return cand
+        which_path = shutil.which("figcraft") or shutil.which("figcraft.exe")
+        if which_path and os.path.exists(which_path):
+            return which_path
+        return None
+
+    def _try_socket_connect(self) -> bool:
         s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(20.0)
+            s.settimeout(2.0)
             s.connect((self.host, self.port))
             self.sock = s
-        except Exception as e:
+            self.sock.settimeout(20.0)
+            return True
+        except Exception:
             if s is not None:
                 try:
                     s.close()
                 except Exception:
                     pass
-            raise ConnectionError(
-                f"[figcraft_ui] Gagal terhubung ke FigCraft di {self.host}:{self.port}. "
-                f"Pastikan aplikasi FigCraft berjalan dengan `--control {self.port}`. Detail: {e}"
-            ) from e
+            return False
+
+    def connect(self):
+        """Connects to FigCraft engine. If auto_launch is True and connection fails, attempts to launch FigCraft."""
+        self._close_socket()
+        if self._try_socket_connect():
+            return
+
+        # If direct connection fails and auto_launch is enabled
+        if self.auto_launch:
+            bin_path = self._find_figcraft_binary()
+            if bin_path:
+                try:
+                    print(f"[figcraft_ui] FigCraft belum aktif di {self.host}:{self.port}. Meluncurkan: {bin_path} --control {self.port} ...")
+                    subprocess.Popen(
+                        [bin_path, "--control", str(self.port)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        close_fds=(os.name != "nt")
+                    )
+                    start_time = time.time()
+                    timeout = 15.0
+                    while time.time() - start_time < timeout:
+                        time.sleep(0.3)
+                        if self._try_socket_connect():
+                            print(f"[figcraft_ui] Berhasil terhubung ke FigCraft di {self.host}:{self.port}!")
+                            return
+                except Exception as e:
+                    print(f"[figcraft_ui Warning] Gagal meluncurkan FigCraft secara otomatis: {e}")
+
+        raise ConnectionError(
+            f"[figcraft_ui] Gagal terhubung ke FigCraft di {self.host}:{self.port}. "
+            f"Pastikan aplikasi FigCraft berjalan dengan `--control {self.port}`."
+        )
 
     def close(self):
         """Flushes pending batch commands and closes the TCP socket."""
@@ -299,6 +357,8 @@ class FigCraftClient:
             return {"$ref": step_name}
         else:
             res = self.execute(command, clean_params)
+            if self.step_delay_ms > 0:
+                time.sleep(self.step_delay_ms / 1000.0)
             return res.get("id") if isinstance(res, dict) else res
 
     def flush(self, label: str = "Fast UI Batch") -> List[Dict[str, Any]]:
@@ -511,7 +571,7 @@ class FigCraftClient:
             "y": y,
             "width": width,
             "height": height,
-            "select": False,
+            "select": self.live_select,
             "props": p
         }
         if parent is not None:
@@ -580,7 +640,7 @@ class FigCraftClient:
             "name": name,
             "x": x,
             "y": y,
-            "select": False,
+            "select": self.live_select,
             "props": p
         }
         if width is not None:
@@ -636,7 +696,7 @@ class FigCraftClient:
             "width": width,
             "height": height,
             "parent": parent,
-            "select": False,
+            "select": self.live_select,
             "props": p
         }
         return self._enqueue_or_run("node.create", params, as_prefix="rect")
@@ -682,7 +742,7 @@ class FigCraftClient:
             "x": x,
             "y": y,
             "parent": parent,
-            "select": False,
+            "select": self.live_select,
             "props": p
         }
         if width is not None:
@@ -729,7 +789,7 @@ class FigCraftClient:
             "path": path,
             "closed": True,
             "parent": parent,
-            "select": False,
+            "select": self.live_select,
             "props": p
         }
         return self._enqueue_or_run("node.create", params, as_prefix="circ")
@@ -828,7 +888,7 @@ class FigCraftClient:
             "name": name,
             "x": x,
             "y": y,
-            "select": False,
+            "select": self.live_select,
             "props": p
         }
         if width is not None:
@@ -890,6 +950,8 @@ class FigCraftClient:
             }
         })
         return float(target_height)
+
+    equalize_heights = equasize_heights
 
     def verify_layout(
         self,
