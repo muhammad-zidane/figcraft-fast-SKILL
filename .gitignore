@@ -9,12 +9,59 @@ env/
 venv/
 ENV/
 
-# Temporary & test outputs
+# Tooling, linters & test caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editor & backup files
+.vscode/
+.idea/
+*.bak
+*.swp
+*~
+
+# Temporary & generated outputs
 _tmp_test/
 *.tmp
 *.log
+*.figcraft
 _verify_*.png
 _test_*.png
+output/
+
+# Local demo/probe artifacts (non-CI)
+test/
+scripts/probe_stage_3_3_readonly_batch.py
+scripts/test_engine_integration.py
+
+# Internal audit & remediation stage reports
+AUDIT_REPORT.md
+BASELINE.md
+FINAL_TECHNICAL_REVIEW.md
+FINAL_VERIFICATION_REPORT.md
+GIT_FINALIZATION_REPORT.md
+INTEGRATION_PREPARATION_AUDIT.md
+LOCAL_DEPLOYMENT_REPORT.md
+PROJECT_RECOVERY_AUDIT.md
+REMEDIATION_PLAN.md
+REMEDIATION_REVIEW.md
+STAGE_1_REPORT.md
+STAGE_2_REPORT.md
+STAGE_2_5_INTEGRATION_REPORT.md
+STAGE_2_BUFFER_REVIEW_REPORT.md
+STAGE_2_CORRECTION_REPORT.md
+STAGE_3_1_BATCH_FAILURE_AUDIT.md
+STAGE_3_2_IMPLEMENTATION_REPORT.md
+STAGE_3_2_1_IMPLEMENTATION_REPORT.md
+STAGE_3_3_INTEGRATION_REPORT.md
+STAGE_3_3_1_IMPLEMENTATION_REPORT.md
+STAGE_3_4_VERIFY_LAYOUT_AUDIT.md
+STAGE_3_4_1_IMPLEMENTATION_REPORT.md
+STAGE_3_4_2_IMPLEMENTATION_REPORT.md
+STAGE_3_4_3_IMPLEMENTATION_REPORT.md
 
 # OS metadata
 .DS_Store

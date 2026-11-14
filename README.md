@@ -1,147 +1,145 @@
-# FigCraft Fast Skill (v3.1) 🚀
+# FigCraft Fast Skill (v4.0)
 
-> **High-Performance Batch UI/UX Automation Skill for FigCraft using atomic JSON-RPC over TCP port 7979 with strict error handling, design tokens, reusable components, and automated layout auditing.**
+> **High-performance Live Streaming & Atomic Batch UI/UX automation skill for FigCraft over TCP JSON-RPC (port `7979`) with auto-launch, live selection highlights, design tokens, reusable components, and automated layout auditing.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![FigCraft Compatibility](https://img.shields.io/badge/FigCraft-Engine%20v1.0%2B-orange.svg)](https://figcraft.app/)
+[![CI](https://github.com/muhammad-zidane/figcraft-fast-SKILL/actions/workflows/ci.yml/badge.svg)](https://github.com/muhammad-zidane/figcraft-fast-SKILL/actions/workflows/ci.yml)
 
 ---
 
-## 📌 Latar Belakang & Masalah yang Diselesaikan
+## Ringkasan Fitur Utama (v4.0)
 
-Merancang antarmuka (UI/UX) di canvas FigCraft melalui AI Agent sering kali menghadapi tantangan:
-1. **Panggilan RPC Sekuensial**: Mengirim command pembuatan layer satu per satu memakan waktu lama (~6+ detik untuk ratusan layer) dan memenuhi riwayat Undo.
-2. **Glitch Ukuran & Hug-Content**: Parameter default sering kali membuat elemen teks, badge, dan pill tag berubah menjadi kotak persegi kaku (`100x100px`).
-3. **Anomali Container Bersudut Siku (*Ghost White Box*)**: Engine FigCraft otomatis memberikan warna latar putih solid (`#FFFFFF`) pada frame pembungkus flexbox jika tidak dikirimkan `"fills": []` secara eksplisit, menyebabkan elemen di dalamnya tampak menempel tanpa margin.
-4. **Child Overflow & Text Clipping**: Teks panjang sering meluap dari batas parent tanpa terdeteksi jika tidak ada auditor tata letak.
+`figcraft-fast-SKILL` menyediakan library Python zero-dependency (`stdlib` only) dan protokol instruksi AI Agent ([SKILL.md](SKILL.md)) untuk merancang antarmuka UI/UX di **FigCraft** tanpa visual glitch:
 
-**`figcraft-fast-SKILL`** hadir sebagai solusi produksi terpadu:
-- ⚡ **Atomic Batching**: Merender seluruh halaman web (~400 layer) dalam **< 0.3 detik** lewat 1 langkah Undo.
-- 🎨 **Design Tokens & Native Styles**: Sinkronisasi warna dan tipografi langsung ke panel *Styles* FigCraft.
-- 🧩 **UI Components Library**: Komponen tombol, pill tag, badge status, form input, dan card siap pakai yang otomatis *hug-content*.
-- 🛡️ **Automated Layout Auditor (`verify_layout`)**: Mendeteksi *child overflow*, *zero-size layer*, *sibling overlap*, dan *unpadded visual box* secara otomatis.
-- 💾 **File Persistence & Per-Frame Export**: Menyimpan ke format binary `.figcraft` dan mengekspor setiap top-level frame ke PNG beresolusi penuh.
+- **Live Streaming Mode (Default v4.0)**: `auto_batch=False`, `live_select=True`, dan `step_delay_ms=50.0` merakit elemen satu per satu secara langsung di kanvas GUI dengan sorotan seleksi aktif.
+- **Auto-Launch Engine (`auto_launch=True`)**: Secara otomatis mendeteksi dan meluncurkan aplikasi FigCraft dengan `--control <port>` jika engine belum berjalan.
+- **Atomic Batch Mode (`auto_batch=True`)**: Mendukung eksekusi ratusan layer dalam satu panggilan `command.batch` (`onError="abort" | "continue"`) dengan 1 langkah Undo.
+- **Hardened Transport & Error Diagnostics**: Korelasi ID JSON-RPC, validasi buffer stream, rollback/snapshot `last_failed_batch`, serta `last_error` & `last_failure_stage`.
+- **Design Tokens & Native Styles**: Sinkronisasi warna dan tipografi langsung ke panel *Styles* FigCraft via [design_tokens.py](scripts/design_tokens.py).
+- **UI Components Library**: Widget siap pakai (`button`, `pill`, `badge`, `input_field`, `card`, `divider`) dengan *hug-content* otomatis di [figcraft_components.py](scripts/figcraft_components.py).
+- **Automated Layout Auditor (`verify_layout`)**: Pemeriksaan rekursif untuk *child overflow*, *zero-size layer*, *sibling overlap*, dan *unpadded visual box*.
+- **File Persistence & Per-Frame Export**: Penyimpanan proyek `.figcraft` dan ekspor PNG per layar (`export_frames`) maupun seluruh kanvas (`export_page`).
 
 ---
 
-## 📁 Struktur Repository
+## Struktur Repository
 
 ```text
 figcraft-fast-SKILL/
-├── SKILL.md                       # Instruksi skill resmi untuk AI Agent / Antigravity
-├── Evaluasi.md                    # Laporan evaluasi teknis, analisis root cause, dan PRD audit
-├── scripts/                       # Modul Python inti skill
-│   ├── figcraft_ui.py             # Core TCP JSON-RPC client, batching, styles & layout auditor
-│   ├── design_tokens.py          # Palet warna, tipografi, radii, shadow & style sync
-│   ├── figcraft_components.py     # Library komponen: Button, Pill, Badge, Input, Card, Divider
-│   └── smoke_test.py              # Test suite otomatis memvalidasi seluruh fitur #1-#8
-├── examples/                      # Contoh implementasi end-to-end
-│   ├── build_berrycrumb_screens.py # Skrip 6 layar responsif toko kue BerryCrumb Patisserie
-│   ├── PRDBerryCrumbPatisserie.pdf # Acuan PRD lengkap
-│   └── berrycrumb_preview.png      # Hasil render gabungan 6 layar
+├── .github/
+│   ├── workflows/ci.yml               # GitHub Actions CI (unittest & py_compile)
+│   └── PULL_REQUEST_TEMPLATE.md
+├── SKILL.md                           # Protokol resmi v4.0 untuk AI Agent / Antigravity
+├── README.md                          # Dokumentasi utama repository
+├── CHANGELOG.md                       # Riwayat rilis (v3.1 -> v4.0)
+├── CONTRIBUTING.md                    # Panduan kontribusi & pengujian
+├── Evaluasi.md                        # Evaluasi teknis & analisis root cause awal
+├── scripts/
+│   ├── figcraft_ui.py                 # Core TCP JSON-RPC client, auto-launch, live/batch & verify_layout
+│   ├── design_tokens.py               # Palet warna, tipografi, radii, shadow & style sync
+│   ├── figcraft_components.py         # Library komponen UI high-level
+│   ├── smoke_test.py                  # End-to-end smoke test terhadap engine FigCraft aktif
+│   ├── test_socket_lifecycle.py       # Unit test lifecycle soket & auto-launch (mock)
+│   ├── test_transport_reliability.py  # Unit test transport & korelasi ID JSON-RPC (mock)
+│   ├── test_batch_reliability.py      # Unit test batch queue, strict/loose & live mode (mock)
+│   └── test_verify_layout.py          # Unit test auditor verify_layout & validasi bounds (mock)
+├── examples/
+│   ├── login_web_blue.py              # Contoh v4.0 Live Streaming (SaaS Web Login Blue Theme)
+│   ├── build_berrycrumb_screens.py    # Contoh v3.1 Atomic Batch (6 layar BerryCrumb Patisserie)
+│   ├── PRDBerryCrumbPatisserie.pdf    # Dokumen acuan PRD contoh BerryCrumb
+│   ├── berrycrumb_preview.png         # Preview hasil ekspor BerryCrumb
+│   └── exports/
+│       └── 01_Web_Login_Screen.png    # Preview hasil ekspor login_web_blue.py
+├── .gitattributes
 ├── .gitignore
-├── LICENSE
-└── README.md
+└── LICENSE
 ```
 
 ---
 
-## 🚀 Panduan Memulai Cepat
+## Panduan Memulai Cepat
 
 ### 1. Prasyarat
-- Python 3.10 atau lebih baru.
-- Aplikasi Desktop **FigCraft** berjalan dengan argumen control port:
-  ```powershell
-  figcraft --control 7979
-  ```
+- **Python 3.10+** (tanpa paket pihak ketiga tambahan).
+- **FigCraft Desktop App** (terpasang di mesin untuk auto-launch, atau berjalan manual dengan `figcraft --control 7979`).
 
 ### 2. Instalasi Skill ke Antigravity / Gemini CLI
-Salin isi folder repository ini ke direktori skill kustom Anda:
+Salin isi repository ini ke direktori skill kustom Anda:
 - **Windows**: `%USERPROFILE%\.gemini\config\skills\figcraft-fast-skill\`
 - **Linux / macOS**: `~/.gemini/config/skills/figcraft-fast-skill/`
 
-Atau impor langsung modul `scripts/` di dalam skrip Python proyek Anda:
+### 3. Contoh Penggunaan (v4.0 Live Streaming Mode)
+
 ```python
 from pathlib import Path
 import sys
 
-# Tambahkan path scripts
-SKILL_DIR = Path.home() / ".gemini" / "config" / "skills" / "figcraft-fast-skill" / "scripts"
-sys.path.insert(0, str(SKILL_DIR))
+LOCAL_SCRIPTS = Path(__file__).resolve().parent / "scripts"
+GLOBAL_SCRIPTS = Path.home() / ".gemini" / "config" / "skills" / "figcraft-fast-skill" / "scripts"
+sys.path.insert(0, str(LOCAL_SCRIPTS if LOCAL_SCRIPTS.exists() else GLOBAL_SCRIPTS))
 
 from figcraft_ui import FigCraftClient
 from design_tokens import DesignTokens
 from figcraft_components import UIComponents
-```
 
----
-
-## 💡 Contoh Penggunaan
-
-```python
-from figcraft_ui import FigCraftClient
-from design_tokens import DesignTokens
-from figcraft_components import UIComponents
 
 def main():
-    # 1. Inisialisasi klien (koneksi TCP ke 127.0.0.1:7979)
-    client = FigCraftClient(host="127.0.0.1", port=7979, auto_batch=True, strict=True)
-    tokens = DesignTokens()
-    ui = UIComponents(client, tokens)
+    # Default v4.0: Live Streaming (50ms) + auto_launch=True
+    with FigCraftClient(
+        host="127.0.0.1",
+        port=7979,
+        auto_batch=False,
+        strict=True,
+        live_select=True,
+        step_delay_ms=50.0,
+        auto_launch=True,
+    ) as client:
+        tokens = DesignTokens()
+        ui = UIComponents(client, tokens)
 
-    # 2. Bersihkan canvas & daftarkan Styles native
-    client.clear_canvas()
-    tokens.sync_to_figcraft_styles(client)
+        client.clear_canvas()
+        tokens.sync_to_figcraft_styles(client)
 
-    # 3. Buat Frame Layar Utama (1440x900)
-    screen = client.create_frame("Desktop_Screen", x=0, y=0, width=1440, height=900, fill=tokens.bg_canvas)
+        screen = client.create_frame("Desktop_Screen", x=0, y=0, width=1440, height=900, fill=tokens.bg_canvas)
+        row = client.box(parent=screen, name="CardRow", layout="horizontal", x=80, y=100, gap=24)
 
-    # 4. Bangun Layout & Komponen
-    row = client.box(parent=screen, name="CardRow", layout="horizontal", x=80, y=100, gap=24)
-    
-    card1 = ui.card(parent=row, name="ProductCard", width=300)
-    client.create_text(parent=card1, text="Artisanal French Pastry", fontSize=18, fontStyle="Bold")
-    ui.button(parent=card1, label="Beli Sekarang", variant="primary")
+        card = ui.card(parent=row, name="ProductCard", width=300)
+        client.create_text(parent=card, text="Artisanal French Pastry", fontSize=18, fontStyle="Bold")
+        ui.button(parent=card, label="Beli Sekarang", variant="primary")
 
-    # 5. Audit Layout (Wajib 0 Violations)
-    report = client.verify_layout([screen])
-    assert report["ok"], f"Layout violations found: {report['violations']}"
-    print(f"✓ Layout verified with 0 violations!")
+        report = client.verify_layout([screen])
+        assert report["ok"], f"Layout violations found: {report['violations']}"
 
-    # 6. Simpan File Desain & Ekspor PNG
-    client.save_file("./output_design.figcraft")
-    client.export_page("./preview.png")
-    client.export_frames([screen], output_dir="./exports")
+        client.save_file("./output/output_design.figcraft")
+        client.export_frames([screen], output_dir="./output/exports")
 
-    client.close()
 
 if __name__ == "__main__":
     main()
 ```
 
+Untuk **Atomic Batch Mode** (eksekusi massal dalam 1 transaksi Undo), kirim `auto_batch=True` dan akhiri dengan `client.flush()`.
+
 ---
 
-## 🧪 Menjalankan Verifikasi Suite (Smoke Test)
+## Pengujian (Testing)
 
-Pastikan aplikasi FigCraft aktif di port `7979`, lalu jalankan:
+### Unit Test Suite (Tanpa Memerlukan FigCraft Engine)
+Seluruh unit test menggunakan mock socket/process dan berjalan di CI:
+
+```powershell
+python -m unittest discover -s scripts -p "test_*.py" -v
+```
+
+### Live Smoke Test (Memerlukan FigCraft Engine di Port `7979`)
+
 ```powershell
 python scripts/smoke_test.py
 ```
 
-Jika berhasil, output akan menampilkan:
-```text
-=== Running figcraft-fast-skill v3.0 Smoke Test ===
-  [OK] equasize_heights auto-measured height = 156.0px
-  [OK] verify_layout passed with 0 violations
-  [OK] verify_layout accurately detected unpadded_visual_box violation
-  [OK] save_file written to .../smoke_test.figcraft
-  [OK] export_frames written ...
-=== ALL SMOKE TESTS PASSED SUCCESSFULLY ===
-```
-
 ---
 
-## 📄 Lisensi
+## Lisensi
 
 Proyek ini dilisensikan di bawah [MIT License](LICENSE).

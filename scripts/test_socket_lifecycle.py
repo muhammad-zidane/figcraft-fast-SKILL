@@ -4,7 +4,7 @@ Tests socket lifecycle behaviors using mock socket objects without connecting to
 """
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 import sys
 from pathlib import Path
 
@@ -20,27 +20,27 @@ class TestSocketLifecycle(unittest.TestCase):
 
     @patch.object(figcraft_ui.socket, "socket")
     def test_01_successful_connection(self, mock_socket_factory):
-        """Test 1: Successful connection initializes socket and sets timeout."""
+        """Test 1: Successful connection initializes socket with connect probe timeout then 20s operational timeout."""
         mock_sock = MagicMock()
         mock_socket_factory.return_value = mock_sock
 
         client = FigCraftClient(host="127.0.0.1", port=7979)
 
         mock_socket_factory.assert_called_once_with(figcraft_ui.socket.AF_INET, figcraft_ui.socket.SOCK_STREAM)
-        mock_sock.settimeout.assert_called_once_with(20.0)
+        self.assertEqual(mock_sock.settimeout.call_args_list, [call(2.0), call(20.0)])
         mock_sock.connect.assert_called_once_with(("127.0.0.1", 7979))
         self.assertEqual(client.sock, mock_sock)
         self.assertEqual(client._buffer, "")
 
     @patch.object(figcraft_ui.socket, "socket")
     def test_02_failed_connection_closes_local_socket(self, mock_socket_factory):
-        """Test 2: Failed connection closes local socket and raises ConnectionError."""
+        """Test 2: Failed connection with auto_launch=False closes local socket and raises ConnectionError."""
         mock_sock = MagicMock()
         mock_sock.connect.side_effect = OSError("Connection refused")
         mock_socket_factory.return_value = mock_sock
 
         with self.assertRaises(ConnectionError) as ctx:
-            FigCraftClient(host="127.0.0.1", port=7979)
+            FigCraftClient(host="127.0.0.1", port=7979, auto_launch=False)
 
         self.assertIn("Gagal terhubung ke FigCraft", str(ctx.exception))
         # Ensure the local socket instance that failed to connect was closed
@@ -137,6 +137,63 @@ class TestSocketLifecycle(unittest.TestCase):
                 raise KeyError("Original domain error")
 
         self.assertIn("Original domain error", str(ctx.exception))
+
+    @patch.object(figcraft_ui.subprocess, "Popen")
+    @patch.object(figcraft_ui.socket, "socket")
+    def test_08_auto_launch_disabled_does_not_spawn_process(self, mock_socket_factory, mock_popen):
+        """Test 8 (v4.0): auto_launch=False never searches for binaries or spawns subprocesses."""
+        mock_sock = MagicMock()
+        mock_sock.connect.side_effect = OSError("Connection refused")
+        mock_socket_factory.return_value = mock_sock
+
+        with self.assertRaises(ConnectionError):
+            FigCraftClient(host="127.0.0.1", port=7979, auto_launch=False)
+
+        mock_popen.assert_not_called()
+
+    @patch.object(figcraft_ui.time, "sleep")
+    @patch.object(figcraft_ui.subprocess, "Popen")
+    @patch.object(figcraft_ui.socket, "socket")
+    def test_09_auto_launch_spawns_and_retries_until_connected(self, mock_socket_factory, mock_popen, mock_sleep):
+        """Test 9 (v4.0): auto_launch=True spawns figcraft binary and retries until socket connects."""
+        mock_sock = MagicMock()
+        # First probe fails, second probe after Popen succeeds
+        mock_sock.connect.side_effect = [OSError("Connection refused"), None]
+        mock_socket_factory.return_value = mock_sock
+
+        with patch.object(FigCraftClient, "_find_figcraft_binary", return_value=r"C:\Fake\figcraft.exe"):
+            client = FigCraftClient(host="127.0.0.1", port=7979, auto_launch=True)
+
+        mock_popen.assert_called_once()
+        popen_args = mock_popen.call_args[0][0]
+        self.assertEqual(popen_args, [r"C:\Fake\figcraft.exe", "--control", "7979"])
+        mock_sleep.assert_called_with(0.3)
+        self.assertIs(client.sock, mock_sock)
+
+    @patch.object(figcraft_ui.subprocess, "Popen")
+    @patch.object(figcraft_ui.socket, "socket")
+    def test_10_auto_launch_missing_binary_raises_connection_error(self, mock_socket_factory, mock_popen):
+        """Test 10 (v4.0): auto_launch=True raises ConnectionError cleanly when no binary is found."""
+        mock_sock = MagicMock()
+        mock_sock.connect.side_effect = OSError("Connection refused")
+        mock_socket_factory.return_value = mock_sock
+
+        with patch.object(FigCraftClient, "_find_figcraft_binary", return_value=None):
+            with self.assertRaises(ConnectionError) as ctx:
+                FigCraftClient(host="127.0.0.1", port=7979, auto_launch=True)
+
+        self.assertIn("Gagal terhubung ke FigCraft", str(ctx.exception))
+        mock_popen.assert_not_called()
+
+    @patch.object(figcraft_ui.os.path, "exists")
+    @patch.object(figcraft_ui.socket, "socket")
+    def test_11_find_figcraft_binary_prefers_explicit_app_path(self, mock_socket_factory, mock_exists):
+        """Test 11 (v4.0): _find_figcraft_binary returns explicit app_path when it exists."""
+        mock_socket_factory.return_value = MagicMock()
+        mock_exists.side_effect = lambda p: p == r"D:\Custom\figcraft.exe"
+
+        client = FigCraftClient(host="127.0.0.1", port=7979, app_path=r"D:\Custom\figcraft.exe")
+        self.assertEqual(client._find_figcraft_binary(), r"D:\Custom\figcraft.exe")
 
 
 if __name__ == "__main__":
