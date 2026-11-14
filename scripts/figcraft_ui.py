@@ -8,6 +8,8 @@ import json
 import os
 import time
 import re
+import copy
+import math
 from typing import Union, List, Dict, Optional, Any
 
 NodeRef = Union[int, str, Dict[str, str]]
@@ -38,21 +40,36 @@ class FigCraftClient:
         self._resolved_refs: Dict[str, int] = {}
         self.total_rpc_ms: float = 0.0
         self.last_flush_ms: float = 0.0
+        self.last_error: Optional[str] = None
+        self.last_failure_stage: Optional[str] = None
+        self.last_failed_batch: Optional[List[Dict[str, Any]]] = None
         self.connect()
 
-    def connect(self):
-        """Connects strictly to the configured host:port (no silent port switching)."""
-        if self.sock:
+    def _close_socket(self):
+        """Closes the underlying TCP socket and resets the stream buffer."""
+        self._buffer = ""
+        if self.sock is not None:
             try:
                 self.sock.close()
             except Exception:
                 pass
+            self.sock = None
+
+    def connect(self):
+        """Connects strictly to the configured host:port (no silent port switching)."""
+        self._close_socket()
+        s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(20.0)
             s.connect((self.host, self.port))
             self.sock = s
         except Exception as e:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
             raise ConnectionError(
                 f"[figcraft_ui] Gagal terhubung ke FigCraft di {self.host}:{self.port}. "
                 f"Pastikan aplikasi FigCraft berjalan dengan `--control {self.port}`. Detail: {e}"
@@ -60,37 +77,85 @@ class FigCraftClient:
 
     def close(self):
         """Flushes pending batch commands and closes the TCP socket."""
-        if self._batch_queue:
-            self.flush()
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
+        try:
+            if self._batch_queue:
+                self.flush()
+        finally:
+            self._close_socket()
+
+    def __enter__(self):
+        if not self.sock:
+            self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self._close_socket()
+            return False
+        self.close()
+        return False
 
     def execute(self, command: str, params: Optional[Dict[str, Any]] = None) -> Any:
         """Executes a single engine command immediately over TCP JSON-RPC and measures latency."""
         if params is None:
             params = {}
+        self.last_error = None
+        self.last_failure_stage = None
+
         self._req_id += 1
+        current_req_id = self._req_id
         req = {
             "jsonrpc": "2.0",
-            "id": self._req_id,
+            "id": current_req_id,
             "method": "engine.execute",
             "params": {
                 "command": command,
                 "params": params
             }
         }
-        payload = (json.dumps(req) + "\n").encode("utf-8")
+        try:
+            payload = (json.dumps(req) + "\n").encode("utf-8")
+        except (TypeError, ValueError) as e:
+            self.last_failure_stage = "PRE_SEND"
+            self.last_error = f"Gagal serialisasi JSON untuk `{command}`: {e}"
+            if self.strict:
+                raise FigCraftError(self.last_error) from e
+            print(f"[figcraft_ui Warning] {self.last_error}")
+            return {}
+
+        if not self.sock:
+            try:
+                self.connect()
+            except ConnectionError as e:
+                self.last_failure_stage = "PRE_SEND"
+                self.last_error = f"Gagal menghubungkan soket sebelum mengirim `{command}`: {e}"
+                if self.strict:
+                    raise
+                print(f"[figcraft_ui Warning] {self.last_error}")
+                return {}
+
+        if self._buffer.strip():
+            stale_data = self._buffer
+            self._close_socket()
+            self.last_failure_stage = "INVALID_RESPONSE"
+            self.last_error = f"Buffer stream TCP tidak kosong sebelum pengiriman `{command}`: {stale_data!r}"
+            if self.strict:
+                raise FigCraftError(self.last_error)
+            print(f"[figcraft_ui Warning] {self.last_error}")
+            return {}
+        self._buffer = ""
 
         t0 = time.perf_counter()
         try:
             self.sock.sendall(payload)
-        except (socket.error, BrokenPipeError, AttributeError):
-            self.connect()
-            self.sock.sendall(payload)
+        except (socket.error, BrokenPipeError, OSError) as e:
+            self._close_socket()
+            self.last_failure_stage = "SEND_AMBIGUOUS"
+            self.last_error = f"Transmisi TCP gagal saat mengirim `{command}`: {e}"
+            if self.strict:
+                raise ConnectionError(f"[figcraft_ui] {self.last_error}") from e
+            print(f"[figcraft_ui Warning] {self.last_error}")
+            return {}
 
         buf = self._buffer
         while True:
@@ -100,38 +165,120 @@ class FigCraftClient:
                 if line.strip():
                     elapsed_ms = (time.perf_counter() - t0) * 1000.0
                     self.total_rpc_ms += elapsed_ms
-                    resp = json.loads(line)
+                    try:
+                        resp = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        self._close_socket()
+                        self.last_failure_stage = "INVALID_RESPONSE"
+                        self.last_error = f"Respons JSON tidak valid untuk `{command}`: {e}"
+                        if self.strict:
+                            raise FigCraftError(self.last_error) from e
+                        print(f"[figcraft_ui Warning] {self.last_error}")
+                        return {}
+
+                    if not isinstance(resp, dict):
+                        self._close_socket()
+                        self.last_failure_stage = "INVALID_RESPONSE"
+                        self.last_error = f"Format respons bukan objek JSON untuk `{command}`: {resp}"
+                        if self.strict:
+                            raise FigCraftError(self.last_error)
+                        print(f"[figcraft_ui Warning] {self.last_error}")
+                        return {}
+
+                    resp_id = resp.get("id")
+                    if resp_id is not None and resp_id != current_req_id:
+                        self._close_socket()
+                        self.last_failure_stage = "INVALID_RESPONSE"
+                        self.last_error = f"Mismatch ID respons pada `{command}`: dikirim {current_req_id}, diterima {resp_id}"
+                        if self.strict:
+                            raise FigCraftError(self.last_error)
+                        print(f"[figcraft_ui Warning] {self.last_error}")
+                        return {}
+
+                    if "ok" not in resp:
+                        self._close_socket()
+                        self.last_failure_stage = "INVALID_RESPONSE"
+                        self.last_error = f"Format respons tidak memiliki field 'ok' untuk `{command}`: {resp}"
+                        if self.strict:
+                            raise FigCraftError(self.last_error)
+                        print(f"[figcraft_ui Warning] {self.last_error}")
+                        return {}
+
+                    # Reject unexpected extra responses in buffer for synchronous 1:1 RPC
+                    if self._buffer.strip():
+                        extra_data = self._buffer
+                        self._close_socket()
+                        self.last_failure_stage = "INVALID_RESPONSE"
+                        self.last_error = f"Menerima respons/data ekstra yang tidak terduga pada `{command}`: {extra_data!r}"
+                        if self.strict:
+                            raise FigCraftError(self.last_error)
+                        print(f"[figcraft_ui Warning] {self.last_error}")
+                        return {}
+
+                    self._buffer = ""
+
                     if not resp.get("ok", False):
                         err_msg = resp.get("error", "Unknown error")
+                        self.last_failure_stage = None
+                        self.last_error = f"Command `{command}` gagal: {err_msg}"
                         if self.strict:
-                            raise FigCraftError(f"Command `{command}` gagal: {err_msg} | Params: {params}")
+                            raise FigCraftError(f"{self.last_error} | Params: {params}")
                         print(f"[figcraft_ui Warning] `{command}` failed: {err_msg}")
+                        return {}
+
                     return resp.get("result", {})
+                buf = self._buffer
+
             try:
                 chunk = self.sock.recv(65536).decode("utf-8")
                 if not chunk:
-                    break
+                    is_incomplete = bool(buf.strip())
+                    self._close_socket()
+                    self.last_failure_stage = "RECV_AMBIGUOUS"
+                    if is_incomplete:
+                        self.last_error = f"Koneksi terputus dengan respons tidak lengkap untuk `{command}`: {buf!r}"
+                    else:
+                        self.last_error = f"Koneksi ditutup oleh FigCraft Engine tanpa respons untuk `{command}`."
+                    if self.strict:
+                        raise ConnectionError(f"[figcraft_ui] {self.last_error}")
+                    print(f"[figcraft_ui Warning] {self.last_error}")
+                    return {}
                 buf += chunk
+                self._buffer = buf
             except socket.timeout as e:
+                self._close_socket()
+                self.last_failure_stage = "RECV_AMBIGUOUS"
+                self.last_error = f"Timeout saat menunggu respons `{command}`"
                 if self.strict:
-                    raise FigCraftError(f"Timeout saat menunggu respons `{command}`") from e
-                break
-
-        if buf.strip():
-            resp = json.loads(buf)
-            self._buffer = ""
-            if not resp.get("ok", False) and self.strict:
-                raise FigCraftError(f"Command `{command}` gagal: {resp.get('error')}")
-            return resp.get("result", {})
-        return {}
+                    raise FigCraftError(self.last_error) from e
+                print(f"[figcraft_ui Warning] {self.last_error}")
+                return {}
+            except (socket.error, OSError, UnicodeDecodeError) as e:
+                self._close_socket()
+                self.last_failure_stage = "RECV_AMBIGUOUS"
+                self.last_error = f"Kesalahan soket saat membaca respons `{command}`: {e}"
+                if self.strict:
+                    raise ConnectionError(f"[figcraft_ui] {self.last_error}") from e
+                print(f"[figcraft_ui Warning] {self.last_error}")
+                return {}
 
     def _resolve_param_refs(self, obj: Any) -> Any:
-        """Recursively substitutes already-flushed `$ref` dicts with their integer IDs."""
+        """Recursively substitutes already-flushed `$ref` dicts with their integer IDs,
+        and validates that unresolved `$ref` references exist in the active batch queue."""
         if isinstance(obj, dict):
             if "$ref" in obj and len(obj) == 1:
                 ref_key = obj["$ref"]
                 if ref_key in self._resolved_refs:
                     return self._resolved_refs[ref_key]
+                if not self.auto_batch:
+                    err_msg = f"Unresolved reference '$ref': '{ref_key}' cannot be used when auto_batch=False"
+                    self.last_error = err_msg
+                    raise FigCraftError(err_msg)
+                in_active_queue = any(cmd.get("as") == ref_key for cmd in self._batch_queue)
+                if not in_active_queue:
+                    err_msg = f"Dangling reference detected: '$ref': '{ref_key}' is neither resolved nor in the active batch queue"
+                    self.last_error = err_msg
+                    raise FigCraftError(err_msg)
                 return obj
             return {k: self._resolve_param_refs(v) for k, v in obj.items()}
         if isinstance(obj, list):
@@ -158,29 +305,163 @@ class FigCraftClient:
         """Flushes all queued commands in one atomic `command.batch` call."""
         if not self._batch_queue:
             return []
-        commands = self._batch_queue
+        commands = list(self._batch_queue)
         self._batch_queue = []
         t0 = time.perf_counter()
-        results = self.execute("command.batch", {
-            "label": label,
-            "onError": "abort" if self.strict else "continue",
-            "commands": commands
-        })
+        results = None
+        try:
+            results = self.execute("command.batch", {
+                "label": label,
+                "onError": "abort" if self.strict else "continue",
+                "commands": commands
+            })
+        except Exception as e:
+            self.last_failed_batch = copy.deepcopy(commands)
+            if not self.last_error:
+                self.last_error = str(e)
+            raise
+
         self.last_flush_ms = (time.perf_counter() - t0) * 1000.0
 
-        if isinstance(results, list):
-            for cmd_item, res_item in zip(commands, results):
+        if not isinstance(results, list):
+            self.last_failed_batch = copy.deepcopy(commands)
+            err_msg = self.last_error or f"Invalid batch response: expected list of results, got {type(results).__name__}"
+            self.last_error = err_msg
+            if self.strict:
+                raise FigCraftError(err_msg)
+            return []
+
+        if len(results) != len(commands):
+            self.last_failed_batch = copy.deepcopy(commands)
+            mismatch_msg = f"Batch result count mismatch: expected {len(commands)}, got {len(results)}"
+            self.last_error = mismatch_msg
+            if self.strict:
+                raise FigCraftError(mismatch_msg)
+            return results
+
+        staged_refs: Dict[str, int] = {}
+        has_structural_failure = False
+        has_step_failure = False
+        first_error_msg: Optional[str] = None
+
+        if self.strict:
+            # Abort mode (strict=True): Engine returns raw command results in order
+            # (dict, list, scalar, or None), or a step error dict in mocked unit tests.
+            for idx, (cmd_item, res_item) in enumerate(zip(commands, results)):
                 as_name = cmd_item.get("as")
-                if as_name and isinstance(res_item, dict):
+                cmd_name = cmd_item.get("command")
+
+                if isinstance(res_item, dict):
+                    is_ok = res_item.get("ok")
+                    if is_ok is False or (is_ok is None and "error" in res_item):
+                        has_step_failure = True
+                        step_err = res_item.get("error", "Unknown batch step error")
+                        err_text = f"Batch step '{as_name}' ({cmd_name}) failed: {step_err}"
+                        if not first_error_msg:
+                            first_error_msg = err_text
+                            self.last_error = err_text
+                        continue
+
                     inner = res_item.get("result", res_item) if "ok" in res_item else res_item
-                    if isinstance(inner, dict) and "id" in inner:
-                        self._resolved_refs[as_name] = inner["id"]
-                    elif isinstance(res_item, dict) and not res_item.get("ok", True):
-                        err = res_item.get("error", "Unknown batch step error")
-                        if self.strict:
-                            raise FigCraftError(f"Batch step `{as_name}` ({cmd_item.get('command')}) gagal: {err}")
-                        print(f"[figcraft_ui Batch Error] Step `{as_name}`: {err}")
-        return results if isinstance(results, list) else []
+                    if (
+                        as_name
+                        and isinstance(inner, dict)
+                        and isinstance(inner.get("id"), int)
+                        and not isinstance(inner.get("id"), bool)
+                    ):
+                        staged_refs[as_name] = inner["id"]
+                elif res_item is not None and not isinstance(res_item, (list, int, float, str, bool)):
+                    has_structural_failure = True
+                    err_text = f"Invalid batch step result format at index {idx}: unexpected type {type(res_item).__name__}"
+                    if not first_error_msg:
+                        first_error_msg = err_text
+                        self.last_error = err_text
+        else:
+            # Continue mode (strict=False): Engine returns per-step wrapper dicts
+            # {command, ok, result|error, step}.
+            for idx, (cmd_item, res_item) in enumerate(zip(commands, results)):
+                as_name = cmd_item.get("as")
+                cmd_name = cmd_item.get("command")
+
+                if not isinstance(res_item, dict):
+                    has_structural_failure = True
+                    err_text = f"Malformed batch step wrapper at index {idx}: expected dict, got {type(res_item).__name__}"
+                    if not first_error_msg:
+                        first_error_msg = err_text
+                        self.last_error = err_text
+                    continue
+
+                is_ok = res_item.get("ok")
+                if not isinstance(is_ok, bool):
+                    has_structural_failure = True
+                    err_text = f"Malformed batch step wrapper at index {idx}: missing or non-boolean 'ok' field"
+                    if not first_error_msg:
+                        first_error_msg = err_text
+                        self.last_error = err_text
+                    continue
+
+                if "step" in res_item and res_item["step"] != idx:
+                    has_structural_failure = True
+                    err_text = f"Malformed batch step wrapper at index {idx}: expected step {idx}, got {res_item['step']!r}"
+                    if not first_error_msg:
+                        first_error_msg = err_text
+                        self.last_error = err_text
+                    continue
+
+                if "command" in res_item and res_item["command"] != cmd_name:
+                    has_structural_failure = True
+                    err_text = (
+                        f"Malformed batch step wrapper at index {idx}: "
+                        f"expected command '{cmd_name}', got {res_item['command']!r}"
+                    )
+                    if not first_error_msg:
+                        first_error_msg = err_text
+                        self.last_error = err_text
+                    continue
+
+                if not is_ok:
+                    has_step_failure = True
+                    step_err = res_item.get("error", "Unknown batch step error")
+                    err_text = f"Batch step '{as_name}' ({cmd_name}) failed: {step_err}"
+                    if not first_error_msg:
+                        first_error_msg = err_text
+                        self.last_error = err_text
+                    print(f"[figcraft_ui Batch Error] Step '{as_name}': {step_err}")
+                    continue
+
+                if "result" not in res_item:
+                    has_structural_failure = True
+                    err_text = f"Malformed batch step wrapper at index {idx}: missing 'result' field for ok=True step"
+                    if not first_error_msg:
+                        first_error_msg = err_text
+                        self.last_error = err_text
+                    continue
+
+                inner = res_item["result"]
+                if (
+                    as_name
+                    and isinstance(inner, dict)
+                    and isinstance(inner.get("id"), int)
+                    and not isinstance(inner.get("id"), bool)
+                ):
+                    staged_refs[as_name] = inner["id"]
+
+        if has_structural_failure:
+            self.last_failed_batch = copy.deepcopy(commands)
+            if self.strict:
+                raise FigCraftError(first_error_msg or "Invalid batch response structure")
+            return results
+
+        if has_step_failure:
+            self.last_failed_batch = copy.deepcopy(commands)
+            if self.strict:
+                raise FigCraftError(first_error_msg or "Batch execution failed")
+            self._resolved_refs.update(staged_refs)
+            return results
+
+        self._resolved_refs.update(staged_refs)
+        self.last_failed_batch = None
+        return results
 
     def resolve_id(self, ref: NodeRef) -> Optional[int]:
         """Resolves a `$ref` dictionary or integer ID into a concrete integer layer ID."""
@@ -624,147 +905,302 @@ class FigCraftClient:
         4. Unpadded Visual Box (text flush at 0px top-left of a visibly filled/stroked container)
         Returns `{"ok": bool, "violation_count": int, "violations": [...]}`.
         """
+        violations: List[Dict[str, Any]] = []
+
+        def _fail_audit(err_msg: str) -> Dict[str, Any]:
+            self.last_error = err_msg
+            if self.strict:
+                raise FigCraftError(err_msg)
+            return {
+                "ok": False,
+                "error": err_msg,
+                "violation_count": len(violations),
+                "violations": violations
+            }
+
         if self._batch_queue:
             self.flush(label="Pre-Verify Flush")
+            if self.last_error is not None or self.last_failed_batch is not None:
+                return _fail_audit(self.last_error or "Pre-verify batch flush failed")
 
         target_ids: List[int] = []
-        if frame_refs:
-            for ref in frame_refs:
+        if frame_refs is not None:
+            if not isinstance(frame_refs, list) or len(frame_refs) == 0:
+                return _fail_audit("verify_layout requires a non-empty list when frame_refs is provided")
+            for idx, ref in enumerate(frame_refs):
+                if isinstance(ref, bool):
+                    return _fail_audit(f"Unresolved or invalid frame reference at index {idx}: {ref!r}")
                 rid = self.resolve_id(ref)
-                if rid is not None:
-                    target_ids.append(rid)
+                if rid is None or not isinstance(rid, int) or isinstance(rid, bool):
+                    return _fail_audit(f"Unresolved or invalid frame reference at index {idx}: {ref!r}")
+                target_ids.append(rid)
         else:
             found = self.execute("node.find", {"type": "FRAME", "limit": 500})
-            if isinstance(found, dict) and "ids" in found:
-                target_ids = found["ids"][:20]
-
-        violations: List[Dict[str, Any]] = []
+            if self.last_error is not None:
+                return _fail_audit(self.last_error)
+            if not isinstance(found, dict) or "ids" not in found or not isinstance(found["ids"], list):
+                return _fail_audit(
+                    f"Invalid response from node.find during verify_layout: expected dict with 'ids' list, got {type(found).__name__}"
+                )
+            raw_ids = found["ids"][:20]
+            for idx, fid in enumerate(raw_ids):
+                if not isinstance(fid, int) or isinstance(fid, bool):
+                    return _fail_audit(f"Invalid frame ID in node.find response at index {idx}: {fid!r}")
+                target_ids.append(fid)
+            if not target_ids:
+                return _fail_audit("No target frames found on canvas to audit")
 
         audit_fields = [
             "id", "name", "type", "absoluteBounds", "clip",
             "absolute", "layout", "fills", "strokes", "strokeWeight", "children"
         ]
 
+        class _AuditAbort(Exception):
+            pass
+
+        fetched_node_ids = set()
+        visited_node_ids = set()
+
+        def _abort_or_fail(err_msg: str):
+            self.last_error = err_msg
+            if self.strict:
+                raise FigCraftError(err_msg)
+            raise _AuditAbort(err_msg)
+
+        def _validate_bounds(bounds: Any, node_id: Any, node_name: str) -> Dict[str, float]:
+            if not isinstance(bounds, dict):
+                _abort_or_fail(
+                    f"Invalid or missing absoluteBounds for node {node_name!r} (id={node_id!r}): "
+                    f"expected dict, got {type(bounds).__name__}"
+                )
+            required_keys = ("x", "y", "width", "height")
+            missing_keys = [k for k in required_keys if k not in bounds]
+            if missing_keys:
+                _abort_or_fail(
+                    f"Incomplete absoluteBounds for node {node_name!r} (id={node_id!r}): "
+                    f"missing keys {missing_keys}"
+                )
+            validated: Dict[str, float] = {}
+            for k in required_keys:
+                val = bounds[k]
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    _abort_or_fail(
+                        f"Invalid absoluteBounds[{k!r}] for node {node_name!r} (id={node_id!r}): "
+                        f"expected finite number, got {val!r} ({type(val).__name__})"
+                    )
+                fval = float(val)
+                if not math.isfinite(fval):
+                    _abort_or_fail(
+                        f"Non-finite absoluteBounds[{k!r}] for node {node_name!r} (id={node_id!r}): "
+                        f"got {val!r}"
+                    )
+                validated[k] = fval
+            return validated
+
+        def _prepare_node(node_obj: Dict[str, Any]) -> Dict[str, Any]:
+            raw_children = node_obj.get("children")
+            child_count = node_obj.get("childCount", 0)
+            needs_fetch = (
+                not raw_children
+                and isinstance(child_count, int)
+                and not isinstance(child_count, bool)
+                and child_count > 0
+            )
+            if not needs_fetch:
+                return node_obj
+
+            req_id = node_obj.get("id")
+            if not isinstance(req_id, int) or isinstance(req_id, bool):
+                _abort_or_fail(f"Cannot lazy-fetch subtree in verify_layout: invalid node id {req_id!r}")
+
+            if req_id in fetched_node_ids:
+                return node_obj
+            fetched_node_ids.add(req_id)
+
+            fetched = self.execute("node.get", {"id": req_id, "fields": audit_fields})
+            if self.last_error is not None:
+                _abort_or_fail(self.last_error)
+            if not isinstance(fetched, dict):
+                _abort_or_fail(
+                    f"Lazy fetch for node {req_id} in verify_layout failed: expected dict, got {type(fetched).__name__}"
+                )
+            fetched_id = fetched.get("id")
+            if not isinstance(fetched_id, int) or isinstance(fetched_id, bool) or fetched_id != req_id:
+                _abort_or_fail(
+                    f"Invalid lazy-fetch response for node {req_id} in verify_layout: mismatched or invalid id {fetched_id!r}"
+                )
+            fetched_children = fetched.get("children")
+            if not isinstance(fetched_children, list) or len(fetched_children) == 0:
+                _abort_or_fail(
+                    f"Inconsistent lazy-fetch response for node {req_id} in verify_layout: "
+                    f"childCount={child_count} but children is empty or invalid"
+                )
+            return fetched
+
         def _audit_node(node: Dict[str, Any], screen_name: str, depth: int = 0):
-            p_bounds = node.get("absoluteBounds")
-            p_name = node.get("name", f"id:{node.get('id')}")
+            node = _prepare_node(node)
+            node_id = node.get("id")
+            if isinstance(node_id, int) and not isinstance(node_id, bool):
+                if node_id in visited_node_ids:
+                    return
+                visited_node_ids.add(node_id)
+
+            p_name = node.get("name", f"id:{node_id}")
+            p_bounds = _validate_bounds(node.get("absoluteBounds"), node_id, p_name)
             p_type = node.get("type", "")
-            children = node.get("children", [])
-            if not children and node.get("childCount", 0) > 0 and node.get("id") is not None:
-                fetched = self.execute("node.get", {"id": node["id"], "fields": audit_fields})
-                if isinstance(fetched, dict):
-                    children = fetched.get("children", [])
+            p_layout = node.get("layout")
+            p_fills = node.get("fills")
+            p_strokes = node.get("strokes")
+            p_stroke_weight = node.get("strokeWeight")
+            raw_children = node.get("children", [])
+            _ = node.get("childCount", len(raw_children) if isinstance(raw_children, list) else 0)
 
-            if p_bounds:
-                pw = float(p_bounds.get("width", 0))
-                ph = float(p_bounds.get("height", 0))
-                if pw <= 0 or ph <= 0:
-                    violations.append({
-                        "screen": screen_name,
-                        "kind": "zero_size",
-                        "node_id": node.get("id"),
-                        "node_name": p_name,
-                        "detail": f"Layer memiliki ukuran tidak valid ({pw}x{ph})"
-                    })
+            pw = p_bounds["width"]
+            ph = p_bounds["height"]
+            if pw <= 0 or ph <= 0:
+                violations.append({
+                    "screen": screen_name,
+                    "kind": "zero_size",
+                    "node_id": node_id,
+                    "node_name": p_name,
+                    "detail": f"Layer memiliki ukuran tidak valid ({pw}x{ph})"
+                })
 
-            if p_bounds and children and p_type in ("FRAME", "COMPONENT", "INSTANCE"):
-                px = float(p_bounds["x"])
-                py = float(p_bounds["y"])
-                pr = px + float(p_bounds["width"])
-                pb = py + float(p_bounds["height"])
+            children: List[Dict[str, Any]] = []
+            if isinstance(raw_children, list):
+                for raw_child in raw_children:
+                    if not isinstance(raw_child, dict):
+                        _abort_or_fail(
+                            f"Invalid child entry in node {p_name!r} (id={node_id!r}): "
+                            f"expected dict, got {type(raw_child).__name__}"
+                        )
+                    children.append(_prepare_node(raw_child))
 
-                has_visible_box = bool(node.get("fills")) or (
-                    bool(node.get("strokes")) and float(node.get("strokeWeight") or 0) > 0
+            if children and p_type in ("FRAME", "COMPONENT", "INSTANCE"):
+                px = p_bounds["x"]
+                py = p_bounds["y"]
+                pr = px + pw
+                pb = py + ph
+
+                has_visible_box = bool(p_fills) or (
+                    bool(p_strokes)
+                    and isinstance(p_stroke_weight, (int, float))
+                    and not isinstance(p_stroke_weight, bool)
+                    and float(p_stroke_weight) > 0
                 )
 
                 flow_children: List[Dict[str, Any]] = []
 
                 for child in children:
-                    c_bounds = child.get("absoluteBounds")
-                    c_name = child.get("name", f"id:{child.get('id')}")
+                    c_id = child.get("id")
+                    c_name = child.get("name", f"id:{c_id}")
                     c_type = child.get("type", "")
-                    if c_bounds:
-                        cx = float(c_bounds["x"])
-                        cy = float(c_bounds["y"])
-                        cr = cx + float(c_bounds["width"])
-                        cb = cy + float(c_bounds["height"])
+                    c_bounds = _validate_bounds(child.get("absoluteBounds"), c_id, c_name)
+                    cx = c_bounds["x"]
+                    cy = c_bounds["y"]
+                    cr = cx + c_bounds["width"]
+                    cb = cy + c_bounds["height"]
 
-                        over_r = cr - pr
-                        over_b = cb - pb
-                        over_l = px - cx
-                        over_t = py - cy
+                    over_r = cr - pr
+                    over_b = cb - pb
+                    over_l = px - cx
+                    over_t = py - cy
 
-                        if max(over_r, over_b, over_l, over_t) > tolerance:
+                    if max(over_r, over_b, over_l, over_t) > tolerance:
+                        violations.append({
+                            "screen": screen_name,
+                            "kind": "child_overflow",
+                            "parent_id": node_id,
+                            "parent_name": p_name,
+                            "child_id": c_id,
+                            "child_name": c_name,
+                            "overflow_px": {
+                                "right": round(max(0.0, over_r), 1),
+                                "bottom": round(max(0.0, over_b), 1),
+                                "left": round(max(0.0, over_l), 1),
+                                "top": round(max(0.0, over_t), 1)
+                            }
+                        })
+
+                    # Check 4: Unpadded Visual Box (text flush at 0px against a visibly filled/bordered container)
+                    if depth > 0 and has_visible_box and c_type == "TEXT" and not child.get("absolute"):
+                        if (cx - px) < 1.0 and (cy - py) < 1.0:
                             violations.append({
                                 "screen": screen_name,
-                                "kind": "child_overflow",
-                                "parent_id": node.get("id"),
+                                "kind": "unpadded_visual_box",
+                                "parent_id": node_id,
                                 "parent_name": p_name,
-                                "child_id": child.get("id"),
+                                "child_id": c_id,
                                 "child_name": c_name,
-                                "overflow_px": {
-                                    "right": round(max(0.0, over_r), 1),
-                                    "bottom": round(max(0.0, over_b), 1),
-                                    "left": round(max(0.0, over_l), 1),
-                                    "top": round(max(0.0, over_t), 1)
-                                }
+                                "detail": f"Teks `{c_name}` menempel (0px padding) ke tepi container berwarna/berborder `{p_name}`"
                             })
 
-                        # Check 4: Unpadded Visual Box (text flush at 0px against a visibly filled/bordered container)
-                        if depth > 0 and has_visible_box and c_type == "TEXT" and not child.get("absolute"):
-                            if (cx - px) < 1.0 and (cy - py) < 1.0:
-                                violations.append({
-                                    "screen": screen_name,
-                                    "kind": "unpadded_visual_box",
-                                    "parent_id": node.get("id"),
-                                    "parent_name": p_name,
-                                    "child_id": child.get("id"),
-                                    "child_name": c_name,
-                                    "detail": f"Teks `{c_name}` menempel (0px padding) ke tepi container berwarna/berborder `{p_name}`"
-                                })
-
-                        if not child.get("absolute"):
-                            flow_children.append(child)
-
-                    _audit_node(child, screen_name, depth + 1)
+                    if not child.get("absolute"):
+                        flow_children.append(child)
 
                 # Check 3: Sibling Overlap inside Auto-Layout containers
-                if node.get("layout") and len(flow_children) > 1:
+                if p_layout and len(flow_children) > 1:
                     for i in range(len(flow_children)):
-                        b1 = flow_children[i].get("absoluteBounds")
-                        if not b1:
-                            continue
-                        x1, y1 = float(b1["x"]), float(b1["y"])
-                        r1, bot1 = x1 + float(b1["width"]), y1 + float(b1["height"])
+                        c1 = flow_children[i]
+                        b1 = _validate_bounds(
+                            c1.get("absoluteBounds"),
+                            c1.get("id"),
+                            c1.get("name", f"id:{c1.get('id')}")
+                        )
+                        x1, y1 = b1["x"], b1["y"]
+                        r1, bot1 = x1 + b1["width"], y1 + b1["height"]
                         for j in range(i + 1, len(flow_children)):
-                            b2 = flow_children[j].get("absoluteBounds")
-                            if not b2:
-                                continue
-                            x2, y2 = float(b2["x"]), float(b2["y"])
-                            r2, bot2 = x2 + float(b2["width"]), y2 + float(b2["height"])
+                            c2 = flow_children[j]
+                            b2 = _validate_bounds(
+                                c2.get("absoluteBounds"),
+                                c2.get("id"),
+                                c2.get("name", f"id:{c2.get('id')}")
+                            )
+                            x2, y2 = b2["x"], b2["y"]
+                            r2, bot2 = x2 + b2["width"], y2 + b2["height"]
                             ix = min(r1, r2) - max(x1, x2)
                             iy = min(bot1, bot2) - max(y1, y2)
                             if ix > tolerance and iy > tolerance:
                                 violations.append({
                                     "screen": screen_name,
                                     "kind": "sibling_overlap",
-                                    "parent_id": node.get("id"),
+                                    "parent_id": node_id,
                                     "parent_name": p_name,
-                                    "child_a": flow_children[i].get("name"),
-                                    "child_b": flow_children[j].get("name"),
+                                    "child_a": c1.get("name"),
+                                    "child_b": c2.get("name"),
                                     "overlap_px": {"x": round(ix, 1), "y": round(iy, 1)}
                                 })
 
-        for fid in target_ids:
-            tree = self.execute("node.get", {
-                "id": fid,
-                "fields": [
-                    "id", "name", "type", "absoluteBounds", "clip",
-                    "absolute", "layout", "fills", "strokes", "strokeWeight", "children"
-                ]
-            })
-            if isinstance(tree, dict) and "id" in tree:
+            # Separated child subtree traversal: executes for all container types (including GROUP and SECTION)
+            for child in children:
+                _audit_node(child, screen_name, depth + 1)
+
+        audited_frames = 0
+        try:
+            for fid in target_ids:
+                fetched_node_ids.add(fid)
+                tree = self.execute("node.get", {
+                    "id": fid,
+                    "fields": audit_fields
+                })
+                if self.last_error is not None:
+                    return _fail_audit(self.last_error)
+                if not isinstance(tree, dict):
+                    return _fail_audit(
+                        f"Failed to fetch frame {fid} in verify_layout: expected dict, got {type(tree).__name__}"
+                    )
+                tree_id = tree.get("id")
+                if not isinstance(tree_id, int) or isinstance(tree_id, bool) or tree_id != fid:
+                    return _fail_audit(
+                        f"Invalid frame response for target {fid} in verify_layout: mismatched or invalid id {tree_id!r}"
+                    )
                 _audit_node(tree, tree.get("name", f"Frame_{fid}"), depth=0)
+                audited_frames += 1
+        except _AuditAbort as abort_exc:
+            return _fail_audit(str(abort_exc))
+
+        if audited_frames == 0:
+            return _fail_audit("No frames were audited in verify_layout")
 
         return {
             "ok": len(violations) == 0,
